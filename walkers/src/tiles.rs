@@ -1,10 +1,11 @@
 use egui::{pos2, Color32, Context, Mesh, Rect, Vec2};
 use egui::{ColorImage, TextureHandle};
+use futures::channel::mpsc::{channel, Receiver, Sender};
 use image::ImageError;
+use lru::LruCache;
 
-use crate::download::{download_continuously, HttpOptions};
+use crate::download::{download_continuously, HttpOptions, MAX_PARALLEL_DOWNLOADS};
 use crate::io::Runtime;
-use crate::limited_map::LimitedMap;
 use crate::mercator::TileId;
 use crate::sources::{Attribution, TileSource};
 
@@ -73,18 +74,20 @@ pub trait Tiles {
 pub struct HttpTiles {
     attribution: Attribution,
 
-    cache: LimitedMap<TileId, Option<Texture>>,
+    cache: LruCache<TileId, Option<Texture>>,
 
     /// Tiles to be downloaded by the IO thread.
-    request_tx: futures::channel::mpsc::Sender<TileId>,
+    request_tx: Sender<TileId>,
 
     /// Tiles that got downloaded and should be put in the cache.
-    tile_rx: futures::channel::mpsc::Receiver<(TileId, Texture)>,
+    tile_rx: Receiver<(TileId, Texture)>,
 
     #[allow(dead_code)] // Significant Drop
     runtime: Runtime,
 
     tile_size: u32,
+
+    max_zoom: u8,
 }
 
 impl HttpTiles {
@@ -101,13 +104,14 @@ impl HttpTiles {
     where
         S: TileSource + Send + 'static,
     {
-        // Minimum value which didn't cause any stalls while testing.
-        let channel_size = 20;
+        // This ensures that newer requests are prioritized.
+        let channel_size = MAX_PARALLEL_DOWNLOADS;
 
-        let (request_tx, request_rx) = futures::channel::mpsc::channel(channel_size);
-        let (tile_tx, tile_rx) = futures::channel::mpsc::channel(channel_size);
+        let (request_tx, request_rx) = channel(channel_size);
+        let (tile_tx, tile_rx) = channel(channel_size);
         let attribution = source.attribution();
         let tile_size = source.tile_size();
+        let max_zoom = source.max_zoom();
 
         let runtime = Runtime::new(download_continuously(
             source,
@@ -117,13 +121,18 @@ impl HttpTiles {
             egui_ctx,
         ));
 
+        // Just arbitrary value which seemed right.
+        #[allow(clippy::unwrap_used)]
+        let cache_size = std::num::NonZeroUsize::new(256).unwrap();
+
         Self {
             attribution,
-            cache: LimitedMap::new(256), // Just arbitrary value which seemed right.
+            cache: LruCache::new(cache_size),
             request_tx,
             tile_rx,
             runtime,
             tile_size,
+            max_zoom,
         }
     }
 
@@ -131,7 +140,7 @@ impl HttpTiles {
         // This is called every frame, so take just one at the time.
         match self.tile_rx.try_next() {
             Ok(Some((tile_id, tile))) => {
-                self.cache.insert(tile_id, Some(tile));
+                self.cache.put(tile_id, Some(tile));
             }
             Err(_) => {
                 // Just ignore. It means that no new tile was downloaded.
@@ -142,36 +151,26 @@ impl HttpTiles {
         }
     }
 
-    fn request_download(&mut self, tile_id: TileId) {
-        if let Ok(()) = self.request_tx.try_send(tile_id) {
-            log::trace!("Requested tile: {:?}", tile_id);
+    fn request_tile(&mut self, tile_id: TileId) -> Option<Texture> {
+        self.cache.get(&tile_id).cloned().unwrap_or_else(|| {
+            if let Ok(()) = self.request_tx.try_send(tile_id) {
+                log::trace!("Requested tile: {:?}", tile_id);
 
-            // None acts as a placeholder for the tile, preventing multiple
-            // requests for the same tile.
-            self.cache.insert(tile_id, None);
-        } else {
-            log::debug!("Request queue is full.");
-        }
+                // None acts as a placeholder for the tile, preventing multiple
+                // requests for the same tile.
+                self.cache.put(tile_id, None);
+            } else {
+                log::debug!("Request queue is full.");
+            }
+            None
+        })
     }
 
     /// Find tile with a different zoom, which could be used as a placeholder.
-    fn placeholder_with_different_zoom(&self, tile_id: TileId) -> Option<TextureWithUv> {
+    fn placeholder_with_different_zoom(&mut self, tile_id: TileId) -> Option<TextureWithUv> {
         // Currently, only a single zoom level down is supported.
 
-        let zoom = tile_id.zoom - 1;
-        let x = (tile_id.x / 2, tile_id.x % 2);
-        let y = (tile_id.y / 2, tile_id.y % 2);
-
-        let zoomed_tile_id = TileId {
-            x: x.0,
-            y: y.0,
-            zoom,
-        };
-
-        let uv = Rect::from_min_max(
-            pos2(x.1 as f32 * 0.5, y.1 as f32 * 0.5),
-            pos2(x.1 as f32 * 0.5 + 0.5, y.1 as f32 * 0.5 + 0.5),
-        );
+        let (zoomed_tile_id, uv) = interpolate_higher_zoom(tile_id, tile_id.zoom.checked_sub(1)?);
 
         if let Some(Some(texture)) = self.cache.get(&zoomed_tile_id) {
             Some(TextureWithUv {
@@ -182,6 +181,31 @@ impl HttpTiles {
             None
         }
     }
+}
+
+/// Take a piece of a tile with higher zoom level and use it as a tile with lower zoom level.
+fn interpolate_higher_zoom(tile_id: TileId, available_zoom: u8) -> (TileId, Rect) {
+    assert!(tile_id.zoom > available_zoom);
+
+    let dzoom = 2u32.pow((tile_id.zoom - available_zoom) as u32);
+
+    let x = (tile_id.x / dzoom, tile_id.x % dzoom);
+    let y = (tile_id.y / dzoom, tile_id.y % dzoom);
+
+    let zoomed_tile_id = TileId {
+        x: x.0,
+        y: y.0,
+        zoom: available_zoom,
+    };
+
+    let z = (dzoom as f32).recip();
+
+    let uv = Rect::from_min_max(
+        pos2(x.1 as f32 * z, y.1 as f32 * z),
+        pos2(x.1 as f32 * z + z, y.1 as f32 * z + z),
+    );
+
+    (zoomed_tile_id, uv)
 }
 
 impl Tiles for HttpTiles {
@@ -195,17 +219,22 @@ impl Tiles for HttpTiles {
     fn at(&mut self, tile_id: TileId) -> Option<TextureWithUv> {
         self.put_next_downloaded_tile_in_cache();
 
-        if let Some(texture) = self.cache.get(&tile_id).cloned() {
-            texture
+        if tile_id.zoom <= self.max_zoom {
+            self.request_tile(tile_id)
+                .map(|texture| TextureWithUv {
+                    texture,
+                    uv: Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+                })
+                .or_else(|| self.placeholder_with_different_zoom(tile_id))
         } else {
-            self.request_download(tile_id);
-            None
+            let (zoomed_tile_id, uv) = interpolate_higher_zoom(tile_id, self.max_zoom);
+
+            self.request_tile(zoomed_tile_id)
+                .map(|texture| TextureWithUv {
+                    texture: texture.clone(),
+                    uv,
+                })
         }
-        .map(|texture| TextureWithUv {
-            texture,
-            uv: Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
-        })
-        .or_else(|| self.placeholder_with_different_zoom(tile_id))
     }
 
     fn tile_size(&self) -> u32 {
@@ -311,7 +340,7 @@ mod tests {
             source,
             HttpOptions {
                 cache: None,
-                user_agent: crate::HeaderValue::from_static("MyApp"),
+                user_agent: Some(crate::HeaderValue::from_static("MyApp")),
             },
             Context::default(),
         );
